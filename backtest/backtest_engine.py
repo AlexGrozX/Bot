@@ -454,6 +454,8 @@ class BacktestRunner:
             min_delta_imbalance=self.delta_min,
             min_confidence=self.min_conf,
             min_rr=self.min_rr,
+            require_htf_for_trend=True,   # Hard HTF requirement
+            min_stop_atr_mult=0.3,        # Reject noise-level stops
         )
 
         # FIX #3: Replace the engine's cooldown check with a bar-time-aware version.

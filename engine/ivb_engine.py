@@ -264,9 +264,11 @@ class IVBEngine:
         balance_lookback_bars:      int   = 48,
         value_area_pct:             float = 0.70,
         lvn_threshold:              float = 0.20,
-        lvn_proximity_pct:          float = 0.003,
-        min_confidence:             float = 0.55,
-        min_rr:                     float = 1.5,
+        lvn_proximity_pct:          float = 0.002,  # tighter: must be within 0.2% of LVN
+        min_confidence:             float = 0.60,   # raised from 0.55 → fewer, higher-quality signals
+        min_rr:                     float = 2.0,    # raised from 1.5 → require better reward
+        min_stop_atr_mult:          float = 0.3,    # new: stop must be ≥ 0.3 ATR to avoid noise
+        require_htf_for_trend:      bool  = True,   # new: TREND_MODEL requires HTF alignment
     ):
         self.feed                       = feed
         self.volume_breakout_multiplier = volume_breakout_multiplier
@@ -277,6 +279,8 @@ class IVBEngine:
         self.lvn_proximity_pct          = lvn_proximity_pct
         self.min_confidence             = min_confidence
         self.min_rr                     = min_rr
+        self.min_stop_atr_mult          = min_stop_atr_mult
+        self.require_htf_for_trend      = require_htf_for_trend
 
         # v2 helpers
         self.mtf        = MTFAggregator()
@@ -402,6 +406,12 @@ class IVBEngine:
         htf_trend = self.mtf.htf_trend(ticker)
         htf_aligned = (htf_trend == direction or htf_trend is None)
 
+        # FIX: TREND_MODEL requires HTF alignment when enabled.
+        # Without this, the engine trades against the higher-timeframe trend,
+        # which is the #1 cause of false positives on real data.
+        if self.require_htf_for_trend and htf_trend is not None and not htf_aligned:
+            return None
+
         # v2: ATR-based stops
         atr = self._atr(bars)
         if direction == SignalDirection.LONG:
@@ -410,6 +420,12 @@ class IVBEngine:
         else:
             stop_loss = nearest_lvn + atr * 0.5
             target    = profile.val if profile.val < price else price - 2.5 * atr
+
+        # FIX: Reject signals where the stop is too tight (< min_stop_atr_mult ATR).
+        # Tight stops on equity futures get hit by normal tick noise, not real reversals.
+        stop_dist = abs(price - stop_loss)
+        if stop_dist < atr * self.min_stop_atr_mult:
+            return None
 
         rr = self._rr(price, stop_loss, target)
         if rr < self.min_rr:
@@ -504,8 +520,13 @@ class IVBEngine:
             stop_loss = price + 1.5 * atr
             target    = profile.poc
 
+        # FIX: Reject tight stops
+        stop_dist = abs(price - stop_loss)
+        if stop_dist < atr * self.min_stop_atr_mult:
+            return None
+
         rr = self._rr(price, stop_loss, target)
-        if rr < 1.2:   # Mean reversion allows slightly lower R:R
+        if rr < 1.5:   # Raised from 1.2 to match tighter quality bar
             return None
 
         htf_trend   = self.mtf.htf_trend(ticker)
