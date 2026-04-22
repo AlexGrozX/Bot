@@ -172,23 +172,26 @@ class BloombergFeed:
         """
         Subscribe to real-time intraday bars via //blp/mktbar.
 
-        The correct Bloomberg Desktop API approach is to use a SubscriptionList
-        with a topic string in the form:
+        Per the Bloomberg Core Developer Guide (v1.6, p.41), the correct
+        SubscriptionList format is:
 
-            //blp/mktbar/ticker?eventType=TRADE&interval=5
+            topic   = "//blp/mktbar/ticker/<TICKER>"
+            options = "bar_size=5&start_time=09:30&end_time=16:00"
 
-        NOT createRequest("BarsSubscriptionRequest") — that operation does not
-        exist on the mktbar service and raises error 0x0006000d.
+        The ticker is placed under the /ticker/ subservice path (NOT
+        URL-encoded into the root).  Options are passed as a separate
+        options string, NOT as query parameters on the topic URL.
+        The option name is 'bar_size' (NOT 'interval').
         """
         import blpapi
-        subs = blpapi.SubscriptionList()
+        subs    = blpapi.SubscriptionList()
+        options = (f"bar_size={self.BAR_INTERVAL}"
+                   f"&start_time=09:30&end_time=16:00")
         for ticker in self.tickers:
-            # URL-encode spaces in the ticker for the topic string
-            safe_ticker = ticker.replace(" ", "%20")
-            topic = (f"//blp/mktbar/{safe_ticker}"
-                     f"?eventType=TRADE&interval={self.BAR_INTERVAL}")
-            corr = blpapi.CorrelationId(f"bar:{ticker}")
-            subs.add(topic=topic, correlationId=corr)
+            topic = f"//blp/mktbar/ticker/{ticker}"
+            corr  = blpapi.CorrelationId(f"bar:{ticker}")
+            subs.add(topic=topic, fields=["LAST_PRICE"],
+                     options=options, correlationId=corr)
             logger.info(f"Subscribing bars: {ticker} ({self.BAR_INTERVAL}min)")
         self._session.subscribe(subs)
 
@@ -315,34 +318,45 @@ class BloombergFeed:
     def _process_bar(self, ticker: str, msg):
         """Process a Bloomberg mktbar subscription event.
 
-        The //blp/mktbar service delivers a BarData element containing:
-            OPEN, HIGH, LOW, CLOSE, VOLUME, NUMBER_OF_TICKS, TIME
-        The element name is 'BarData' (not the field names directly on msg).
+        Per the Bloomberg Core Developer Guide the mktbar service sends three
+        message types per bar interval:
+
+          MarketBarStart       — new bar opens; contains OPEN, HIGH, LOW,
+                                 CLOSE, VOLUME, NUMBER_OF_TICKS, TIME
+          MarketBarUpdate      — intra-bar update; contains CLOSE, VOLUME,
+                                 NUMBER_OF_TICKS, TIME (and updated HIGH/LOW)
+          MarketBarIntervalEnd — bar closed; same fields as MarketBarStart
+
+        We only finalise a Bar object on MarketBarIntervalEnd (or
+        MarketBarStart of the *next* bar), and update the running bar on
+        MarketBarUpdate.
         """
+        msg_type = msg.messageType().string() if hasattr(msg.messageType(), 'string') else str(msg.messageType())
+
         with self._lock:
             state = self._states.get(ticker)
             if not state:
                 return
+
+            def _safe(field):
+                try:
+                    return msg.getElementAsFloat(field) if msg.hasElement(field) else None
+                except Exception:
+                    return None
+
+            def _safe_str(field):
+                try:
+                    return msg.getElementAsString(field) if msg.hasElement(field) else None
+                except Exception:
+                    return None
+
             try:
-                # mktbar delivers fields inside a 'BarData' sub-element.
-                # Fall back to reading directly from msg if BarData is absent
-                # (some versions surface fields at the top level).
-                if msg.hasElement("BarData"):
-                    bd = msg.getElement("BarData")
-                    o  = bd.getElementAsFloat("OPEN")
-                    h  = bd.getElementAsFloat("HIGH")
-                    l  = bd.getElementAsFloat("LOW")
-                    c  = bd.getElementAsFloat("CLOSE")
-                    v  = bd.getElementAsFloat("VOLUME")
-                    ts_str = (bd.getElementAsString("TIME")
-                              if bd.hasElement("TIME") else None)
-                else:
-                    o  = msg.getElementAsFloat("OPEN")
-                    h  = msg.getElementAsFloat("HIGH")
-                    l  = msg.getElementAsFloat("LOW")
-                    c  = msg.getElementAsFloat("CLOSE")
-                    v  = msg.getElementAsFloat("VOLUME")
-                    ts_str = None
+                o   = _safe("OPEN")
+                h   = _safe("HIGH")
+                l   = _safe("LOW")
+                c   = _safe("CLOSE")
+                v   = _safe("VOLUME")
+                ts_str = _safe_str("TIME")
 
                 try:
                     ts = (datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
@@ -350,15 +364,53 @@ class BloombergFeed:
                 except ValueError:
                     ts = datetime.now()
 
-                bar = Bar(
-                    timestamp=ts,
-                    open=o, high=h, low=l, close=c, volume=v
-                )
-                state.bars.append(bar)
-                logger.debug(f"Bar [{ticker}] O={bar.open} H={bar.high} "
-                             f"L={bar.low} C={bar.close} V={bar.volume}")
+                current = self._current_bar.get(ticker)
+
+                if msg_type in ("MarketBarStart",):
+                    # New bar opened — start accumulating
+                    if current is not None:
+                        # Finalise previous bar
+                        state.bars.append(current)
+                        if len(state.bars) % 12 == 0:
+                            bars_list = list(state.bars)
+                            state.volume_profile = self.build_volume_profile(
+                                ticker, bars_list, 0.70, 0.20)
+                    self._current_bar[ticker] = Bar(
+                        timestamp=ts,
+                        open=o or (c or 0),
+                        high=h or (c or 0),
+                        low=l  or (c or 0),
+                        close=c or 0,
+                        volume=v or 0,
+                    )
+
+                elif msg_type == "MarketBarUpdate" and current is not None:
+                    # Intra-bar update — patch only the fields that arrived
+                    if h is not None: current.high  = max(current.high,  h)
+                    if l is not None: current.low   = min(current.low,   l)
+                    if c is not None: current.close = c
+                    if v is not None: current.volume = v
+
+                elif msg_type == "MarketBarIntervalEnd":
+                    # Bar closed — finalise
+                    if current is not None:
+                        if h is not None: current.high  = max(current.high,  h)
+                        if l is not None: current.low   = min(current.low,   l)
+                        if c is not None: current.close = c
+                        if v is not None: current.volume = v
+                        state.bars.append(current)
+                        self._current_bar[ticker] = None
+                        logger.debug(f"Bar closed [{ticker}] "
+                                     f"O={current.open} H={current.high} "
+                                     f"L={current.low} C={current.close} "
+                                     f"V={current.volume}")
+                        if len(state.bars) % 12 == 0:
+                            bars_list = list(state.bars)
+                            state.volume_profile = self.build_volume_profile(
+                                ticker, bars_list, 0.70, 0.20)
+
             except Exception as e:
-                logger.debug(f"Bar parse error [{ticker}]: {e}")
+                logger.debug(f"Bar parse error [{ticker}] {msg_type}: {e}")
 
     def build_volume_profile(self, ticker: str, bars: List[Bar],
                               value_area_pct: float = 0.70,
