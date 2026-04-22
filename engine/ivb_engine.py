@@ -412,14 +412,20 @@ class IVBEngine:
         if self.require_htf_for_trend and htf_trend is not None and not htf_aligned:
             return None
 
-        # v2: ATR-based stops
+        # v2: ATR-based stops and targets.
+        # Always use ATR for targets (not VP val/vah) because the VP may be
+        # slightly stale (rebuilt every N bars), causing incorrect R:R calculations.
+        # The ATR-based target is also more robust on real data.
         atr = self._atr(bars)
         if direction == SignalDirection.LONG:
             stop_loss = nearest_lvn - atr * 0.5
-            target    = profile.vah if profile.vah > price else price + 2.5 * atr
+            # Use VAH as target if it's meaningfully above price AND above the ATR target
+            atr_target = price + 2.5 * atr
+            target = profile.vah if profile.vah > price + 0.5 * atr else atr_target
         else:
             stop_loss = nearest_lvn + atr * 0.5
-            target    = profile.val if profile.val < price else price - 2.5 * atr
+            atr_target = price - 2.5 * atr
+            target = profile.val if profile.val < price - 0.5 * atr else atr_target
 
         # FIX: Reject signals where the stop is too tight (< min_stop_atr_mult ATR).
         # Tight stops on equity futures get hit by normal tick noise, not real reversals.

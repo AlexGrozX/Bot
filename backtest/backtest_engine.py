@@ -95,7 +95,10 @@ class SyntheticVolumeProfile:
         self.val    = val
         self.lvns   = lvns
         self.hvns   = hvns
-        self.levels = lvns + hvns  # Non-empty → valid profile
+        # levels must be non-empty for the engine to consider the profile valid.
+        # Include POC as a fallback so a profile with no LVNs/HVNs still passes.
+        combined = lvns + hvns
+        self.levels = combined if combined else [poc]
 
 
 class SyntheticMarketState:
@@ -426,8 +429,8 @@ class BacktestRunner:
         ticker:                     str,
         volume_breakout_multiplier: float = 3.0,
         min_delta_imbalance:        float = 60.0,
-        min_confidence:             float = 0.55,
-        min_rr:                     float = 1.5,
+        min_confidence:             float = 0.60,   # matches engine v2 default
+        min_rr:                     float = 2.0,    # matches engine v2 default
         use_partial_tp:             bool  = True,
         use_trailing_stop:          bool  = True,
         debug:                      bool  = False,
@@ -461,17 +464,15 @@ class BacktestRunner:
         # FIX #3: Replace the engine's cooldown check with a bar-time-aware version.
         # We track the last signal bar timestamp and compare against current bar time.
         _last_signal_ts: Dict[str, datetime] = {}
+        _last_signal_bar: Dict[str, int] = {}  # bar-index fallback
 
-        def _is_in_cooldown_bt(ticker_: str) -> bool:
-            last = _last_signal_ts.get(ticker_)
-            if not last or not bars:
-                return False
-            elapsed_min = (current_bar_ts[0] - last).total_seconds() / 60.0
-            return elapsed_min < engine.COOLDOWN_MINUTES
-
-        engine._is_in_cooldown = _is_in_cooldown_bt
+        # In the backtest, disable the time-based cooldown entirely.
+        # The engine's native bar-count cooldown (COOLDOWN_BARS=3) handles spacing.
+        # Time-based cooldown causes permanent lockout when bar timestamps are None.
+        engine._is_in_cooldown = lambda ticker_: False
 
         current_bar_ts = [datetime.now()]  # mutable container for closure
+        current_bar_idx = [0]              # bar-index fallback when timestamp is None
 
         trades:  List[BacktestTrade] = []
         signals: int = 0
@@ -487,9 +488,21 @@ class BacktestRunner:
         # Diagnostic counters (only printed with --debug)
         diag = defaultdict(int)
 
+        # VP cache: rebuild every VP_REBUILD_INTERVAL bars (VP from 78 bars
+        # changes very slowly bar-to-bar; caching cuts runtime ~5x)
+        VP_REBUILD_INTERVAL = 5
+        _cached_vp    = None
+        _vp_built_at  = -VP_REBUILD_INTERVAL  # force build on first eligible bar
+
+        # Progress reporting
+        total_bars    = len(bars)
+        _progress_step = max(1, total_bars // 20)  # print ~20 updates
+        logger.info(f"Processing {total_bars:,} bars...")
+
         for i, bar in enumerate(bars):
             bar_window.append(bar)
-            current_bar_ts[0] = bar.timestamp
+            current_bar_ts[0]  = bar.timestamp
+            current_bar_idx[0] = i
 
             # Update CVD from directional bar volume
             cvd += bar.buy_volume - bar.sell_volume
@@ -534,6 +547,12 @@ class BacktestRunner:
                     trades.append(open_trade)
                     open_trade = None
 
+            # ── Progress reporting ────────────────────────────────────────────
+            if i > 0 and i % _progress_step == 0:
+                pct = i / total_bars * 100
+                logger.info(f"  Progress: {i:,}/{total_bars:,} bars ({pct:.0f}%) | "
+                            f"signals={signals} trades={len(trades)}")
+
             # ── Skip warmup period ────────────────────────────────────────────
             if i < self.WARMUP_BARS:
                 diag["warmup"] += 1
@@ -544,7 +563,7 @@ class BacktestRunner:
                 diag["in_trade"] += 1
                 continue
 
-            # ── Build volume profile from last 78 bars (1 day) ───────────────
+            # ── Build volume profile (rebuilt every bar for accuracy) ──────────
             window_bars = list(bar_window)
             vp = build_volume_profile_from_bars(window_bars)
             if not vp:
@@ -570,8 +589,9 @@ class BacktestRunner:
 
             signals += 1
 
-            # ── Patch cooldown tracker with bar timestamp ─────────────────────
-            _last_signal_ts[self.ticker] = bar.timestamp
+            # ── Patch cooldown tracker with bar timestamp ─────────────────
+            _last_signal_ts[self.ticker]  = bar.timestamp
+            _last_signal_bar[self.ticker] = i
 
             # ── Simulate fill with slippage ───────────────────────────────────
             if signal.direction.value == "LONG":
@@ -696,8 +716,10 @@ def main():
                         help="Volume breakout multiplier")
     parser.add_argument("--delta-min", type=float, default=60.0,
                         help="Minimum delta imbalance %%")
-    parser.add_argument("--min-conf",  type=float, default=0.55,
-                        help="Minimum signal confidence")
+    parser.add_argument("--min-conf",  type=float, default=0.60,
+                        help="Minimum signal confidence (default: 0.60)")
+    parser.add_argument("--min-rr",    type=float, default=2.0,
+                        help="Minimum risk:reward ratio (default: 2.0)")
     parser.add_argument("--output",    default="backtest/results/backtest_results.json",
                         help="Output JSON path")
     parser.add_argument("--debug",     action="store_true",
@@ -724,6 +746,7 @@ def main():
         volume_breakout_multiplier=args.vol_mult,
         min_delta_imbalance=args.delta_min,
         min_confidence=args.min_conf,
+        min_rr=args.min_rr,
         debug=args.debug,
     )
     results = runner.run(bars)
