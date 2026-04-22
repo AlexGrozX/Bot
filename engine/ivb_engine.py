@@ -385,16 +385,27 @@ class IVBEngine:
         if condition != MarketCondition.OUT_OF_BALANCE:
             return None
 
-        # Location: price at LVN
-        nearest_lvn = self._find_nearest_lvn(price, profile.lvns)
+        # Direction from trend: price above POC = bullish, below = bearish
+        direction = (SignalDirection.LONG if price > profile.poc
+                     else SignalDirection.SHORT)
+
+        # Location: price at LVN on the correct side for the stop.
+        # LONG: stop goes below price, so we need an LVN below price.
+        # SHORT: stop goes above price, so we need an LVN above price.
+        # Using a non-directional nearest-LVN caused stops to land on the
+        # wrong side of entry (e.g., LONG stop above price), which produced
+        # fake wins and a 93% one-bar stop-out rate.
+        if direction == SignalDirection.LONG:
+            lvns_below = [lvn for lvn in profile.lvns if lvn < price]
+            nearest_lvn = max(lvns_below, key=lambda lvn: lvn) if lvns_below else None
+        else:
+            lvns_above = [lvn for lvn in profile.lvns if lvn > price]
+            nearest_lvn = min(lvns_above, key=lambda lvn: lvn) if lvns_above else None
+
         if nearest_lvn is None:
             return None
         if abs(price - nearest_lvn) / price > self.lvn_proximity_pct:
             return None
-
-        # Direction from trend
-        direction = (SignalDirection.LONG if price > profile.poc
-                     else SignalDirection.SHORT)
 
         # Aggression check
         agg = self._assess_aggression(state, bars, direction)
@@ -413,19 +424,24 @@ class IVBEngine:
             return None
 
         # v2: ATR-based stops and targets.
-        # Always use ATR for targets (not VP val/vah) because the VP may be
-        # slightly stale (rebuilt every N bars), causing incorrect R:R calculations.
-        # The ATR-based target is also more robust on real data.
         atr = self._atr(bars)
         if direction == SignalDirection.LONG:
+            # Stop below the nearest LVN below price
             stop_loss = nearest_lvn - atr * 0.5
-            # Use VAH as target if it's meaningfully above price (at least 3x ATR away)
+            # Target: 3.5x ATR above entry (or VAH if far enough away)
             atr_target = price + 3.5 * atr
             target = profile.vah if profile.vah > price + 3.0 * atr else atr_target
         else:
+            # Stop above the nearest LVN above price
             stop_loss = nearest_lvn + atr * 0.5
             atr_target = price - 3.5 * atr
             target = profile.val if profile.val < price - 3.0 * atr else atr_target
+
+        # Sanity check: stop must be on the correct side of entry
+        if direction == SignalDirection.LONG  and stop_loss >= price:
+            return None
+        if direction == SignalDirection.SHORT and stop_loss <= price:
+            return None
 
         # FIX: Reject signals where the stop is too tight (< min_stop_atr_mult ATR).
         # Tight stops on equity futures get hit by normal tick noise, not real reversals.
