@@ -1,1 +1,1 @@
-from execution.executor import IVBExecutor, PolymarketClient, RiskManager, Position
+# execution package — paper trading only
