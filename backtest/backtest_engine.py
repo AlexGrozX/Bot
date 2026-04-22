@@ -429,8 +429,8 @@ class BacktestRunner:
         ticker:                     str,
         volume_breakout_multiplier: float = 3.0,
         min_delta_imbalance:        float = 60.0,
-        min_confidence:             float = 0.60,   # matches engine v2 default
-        min_rr:                     float = 2.0,    # matches engine v2 default
+        min_confidence:             float = 0.65,   # matches engine v2 default
+        min_rr:                     float = 2.5,    # matches engine v2 default
         use_partial_tp:             bool  = True,
         use_trailing_stop:          bool  = True,
         debug:                      bool  = False,
@@ -599,14 +599,20 @@ class BacktestRunner:
             else:
                 fill = signal.entry_price * (1 - self.SLIPPAGE_PCT)
 
+            # Adjust stop_loss and target by the same slippage offset so that
+            # R calculations remain correct relative to the actual fill price.
+            slip_offset = fill - signal.entry_price  # positive for LONG, negative for SHORT
+            adj_stop   = signal.stop_loss + slip_offset
+            adj_target = signal.target    + slip_offset
+
             open_trade = BacktestTrade(
                 ticker=self.ticker,
                 direction=signal.direction.value,
                 setup_type=signal.setup_type.value,
                 entry_bar=i,
                 entry_price=fill,
-                stop_loss=signal.stop_loss,
-                target=signal.target,
+                stop_loss=adj_stop,
+                target=adj_target,
                 confidence=signal.confidence,
             )
 

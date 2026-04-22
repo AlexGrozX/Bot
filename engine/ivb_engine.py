@@ -265,9 +265,9 @@ class IVBEngine:
         value_area_pct:             float = 0.70,
         lvn_threshold:              float = 0.20,
         lvn_proximity_pct:          float = 0.002,  # tighter: must be within 0.2% of LVN
-        min_confidence:             float = 0.60,   # raised from 0.55 → fewer, higher-quality signals
-        min_rr:                     float = 2.0,    # raised from 1.5 → require better reward
-        min_stop_atr_mult:          float = 0.3,    # new: stop must be ≥ 0.3 ATR to avoid noise
+        min_confidence:             float = 0.65,   # raised: 0.65-0.70 bucket had only 6% win rate
+        min_rr:                     float = 2.5,    # raised: avg winner is only 1.48R, need bigger targets
+        min_stop_atr_mult:          float = 0.5,    # raised: sub-3pt stops on ES all failed (12/12)
         require_htf_for_trend:      bool  = True,   # new: TREND_MODEL requires HTF alignment
     ):
         self.feed                       = feed
@@ -419,13 +419,13 @@ class IVBEngine:
         atr = self._atr(bars)
         if direction == SignalDirection.LONG:
             stop_loss = nearest_lvn - atr * 0.5
-            # Use VAH as target if it's meaningfully above price AND above the ATR target
-            atr_target = price + 2.5 * atr
-            target = profile.vah if profile.vah > price + 0.5 * atr else atr_target
+            # Use VAH as target if it's meaningfully above price (at least 3x ATR away)
+            atr_target = price + 3.5 * atr
+            target = profile.vah if profile.vah > price + 3.0 * atr else atr_target
         else:
             stop_loss = nearest_lvn + atr * 0.5
-            atr_target = price - 2.5 * atr
-            target = profile.val if profile.val < price - 0.5 * atr else atr_target
+            atr_target = price - 3.5 * atr
+            target = profile.val if profile.val < price - 3.0 * atr else atr_target
 
         # FIX: Reject signals where the stop is too tight (< min_stop_atr_mult ATR).
         # Tight stops on equity futures get hit by normal tick noise, not real reversals.
