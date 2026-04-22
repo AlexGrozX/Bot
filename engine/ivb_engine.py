@@ -775,25 +775,42 @@ class IVBEngine:
     def _assess_market_state(self, state: MarketState,
                               bars: List[Bar],
                               profile: VolumeProfile) -> MarketCondition:
+        """
+        Determine whether the market is balanced (range-bound) or out-of-balance
+        (trending / directional).
+
+        FIX: The original 0.5% displacement threshold is too tight for equity
+        index futures (ES, NQ) which trade in narrow intraday ranges.  We now
+        use an ATR-relative threshold: price must be more than 0.5 ATR away
+        from the POC to be considered out-of-balance.  This is instrument-
+        agnostic and works for both crypto (wide ATR) and equity futures
+        (narrow ATR).
+        """
         price = state.last_price
         vah   = profile.vah
         val   = profile.val
         poc   = profile.poc
 
+        # ATR-relative displacement threshold (0.5 ATR = meaningful move)
+        atr = self._atr(bars)
+        displacement = abs(price - poc)
+        oob_threshold = max(atr * 0.5, poc * 0.002)  # at least 0.2% of price
+
         if val <= price <= vah:
+            # Inside value area — check for directional momentum breakout
             if len(bars) >= 3:
                 recent_bars = bars[-3:]
                 all_up   = all(b.close > b.open for b in recent_bars)
                 all_down = all(b.close < b.open for b in recent_bars)
-                if len(bars) >= 20:
-                    avg_vol    = statistics.mean(b.volume for b in bars[-20:])
+                if len(bars) >= 10:
+                    avg_vol    = statistics.mean(b.volume for b in bars[-10:])
                     recent_vol = statistics.mean(b.volume for b in recent_bars)
-                    if (all_up or all_down) and recent_vol > avg_vol * 1.5:
+                    if (all_up or all_down) and recent_vol > avg_vol * 1.3:
                         return MarketCondition.OUT_OF_BALANCE
             return MarketCondition.BALANCED
 
-        displacement_pct = abs(price - poc) / poc if poc > 0 else 0
-        if displacement_pct > 0.005:
+        # Outside value area — use ATR-relative displacement
+        if displacement > oob_threshold:
             return MarketCondition.OUT_OF_BALANCE
         return MarketCondition.BALANCED
 
@@ -821,16 +838,32 @@ class IVBEngine:
                         else recent_bar.sell_volume)
         delta_pct = (dominant_vol / total_vol) * 100.0
 
-        cvd = state.cvd
+        # CVD alignment: use the bar's own delta (buy - sell) rather than the
+        # session cumulative CVD.  Session CVD is a monotonically growing number
+        # that is almost always positive, which permanently blocks SHORT signals
+        # and makes the check meaningless.  Bar delta directly reflects whether
+        # the most recent bar was buyer-dominated or seller-dominated.
+        bar_delta = recent_bar.buy_volume - recent_bar.sell_volume
         cvd_aligned = (
-            (direction == SignalDirection.LONG  and cvd > 0) or
-            (direction == SignalDirection.SHORT and cvd < 0)
+            (direction == SignalDirection.LONG  and bar_delta > 0) or
+            (direction == SignalDirection.SHORT and bar_delta < 0)
+        )
+
+        # Also check rolling CVD trend (last 5 bars) as a secondary confirmation.
+        # This is softer — it adds weight but doesn't hard-block.
+        recent_deltas = [getattr(b, 'delta', b.buy_volume - b.sell_volume)
+                         for b in bars[-5:]]
+        rolling_cvd_trend = sum(recent_deltas)
+        rolling_aligned = (
+            (direction == SignalDirection.LONG  and rolling_cvd_trend > 0) or
+            (direction == SignalDirection.SHORT and rolling_cvd_trend < 0)
         )
 
         is_aggressive = (
             vol_ratio  >= self.volume_breakout_multiplier and
             delta_pct  >= self.min_delta_imbalance and
-            cvd_aligned
+            cvd_aligned and
+            rolling_aligned
         )
 
         return (vol_ratio, delta_pct, is_aggressive)
